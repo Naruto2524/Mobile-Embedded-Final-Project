@@ -90,12 +90,16 @@ class AdaptiveHiddenLayer(nn.Module):
             nn.Linear(input_dim, group_size) for _ in range(num_groups)
         ])
 
+        self.bns = nn.ModuleList([
+            nn.BatchNorm1d(group_size) for _ in range(num_groups)
+        ])
+
         # Selector
         self.selector = nn.Linear(input_dim, num_groups)
 
         # Initialization: use Xavier for all
         for m in self.groups:
-            nn.init.xavier_uniform_(m.weight)
+            nn.init.kaiming_uniform_(m.weight, nonlinearity='relu')
             nn.init.constant_(m.bias, 0.0)
 
         nn.init.xavier_uniform_(self.selector.weight)
@@ -104,8 +108,10 @@ class AdaptiveHiddenLayer(nn.Module):
     def forward(self, x: torch.Tensor):
         # Group outputs with ReLU
         group_outputs = []
-        for linear in self.groups:
-            out = F.relu(linear(x))
+        for linear, bn in zip(self.groups, self.bns):
+            z = linear(x)
+            z = bn(z)
+            out = F.relu(z)
             group_outputs.append(out)
 
         # Stack -> (batch, N, group_size)
@@ -273,7 +279,7 @@ def main():
     hog_dim     = 8100
     acc_dim     = 53
     num_classes = 10
-    batch_size  = 128
+    batch_size  = 64
     num_epochs  = 100
     init_lr     = 1e-3
     weight_decay = 1e-4

@@ -277,13 +277,14 @@ def evaluate(model, data_loader, criterion, device, beta_sbr=1.0):
 
 #Robustness
 def evaluate_with_noise(model, data_loader, device, noise_std):
+    print(f"[DEBUG] Evaluating with noise std = {noise_std}")
     model.eval()
     correct, total = 0, 0
 
     with torch.no_grad():
-         for hog, acc, labels in data_loader:
-            hog = hog + noise_std * torch.randn_like(hog)
+        for hog, acc, labels in data_loader:
             hog, acc, labels = hog.to(device), acc.to(device), labels.to(device)
+            hog = hog + noise_std * torch.randn_like(hog)
 
             logits, _ = model(hog, acc)
             correct += (logits.argmax(1) == labels).sum().item()
@@ -309,9 +310,11 @@ def evaluate_confusion_matrix(model, loader, device, class_names):
 
     cm = confusion_matrix(labels_all, preds)
     disp = ConfusionMatrixDisplay(cm, display_labels=class_names)
-    disp.plot(cmap="Blues", xticks_rotation=45)
+    disp.plot(ax=plt.gca(), cmap="Blues", xticks_rotation=45)
     plt.title("Confusion Matrix (Test Set)")
-    plt.show()
+    plt.tight_layout()
+    plt.show(block=True)
+
 
 def main():
     # Config
@@ -320,7 +323,7 @@ def main():
     acc_dim     = 53
     num_classes = 10
     batch_size  = 64
-    num_epochs  = 100
+    num_epochs  = 20
     init_lr     = 1e-3
     weight_decay = 1e-4
     momentum     = 0.9
@@ -387,37 +390,46 @@ def main():
 
     print(f"Best test accuracy: {best_test_acc*100:.2f}%")
 
-    # Plot accuracy
-    plt.figure(figsize=(10,4))
+    fig_acc = plt.figure(figsize=(10, 4))
     plt.plot(train_acc_list, label="Train Accuracy")
-    plt.plot(test_acc_list,  label="Test Accuracy")
+    plt.plot(test_acc_list, label="Test Accuracy")
     plt.title("Accuracy over Epochs")
     plt.xlabel("Epoch")
     plt.ylabel("Accuracy")
     plt.legend()
     plt.grid(True)
-    plt.show()
 
-    # Plot loss
-    plt.figure(figsize=(10,4))
+    fig_loss = plt.figure(figsize=(10, 4))
     plt.plot(train_loss_list, label="Train Loss")
-    plt.plot(test_loss_list,  label="Test Loss")
+    plt.plot(test_loss_list, label="Test Loss")
     plt.title("Loss over Epochs")
     plt.xlabel("Epoch")
     plt.ylabel("Loss")
     plt.legend()
     plt.grid(True)
-    plt.show()
 
     #Robustness
-    print("\nRobustness Evaluation:")
-    for sigma in [0.0, 0.05, 0.1, 0.2]:
+    noise_levels = [0.0, 0.05, 0.1, 0.2]
+    robustness_accs = []
+
+    for sigma in noise_levels:
         acc = evaluate_with_noise(model, test_loader, device, sigma)
+        robustness_accs.append(acc)
         print(f"Noise STD {sigma:.2f} → Accuracy {acc*100:.2f}%")
 
-    # Confusion Matrix
+    fig_robust = plt.figure(figsize=(6, 4))
+    plt.plot(noise_levels, robustness_accs, marker='o')
+    plt.xlabel("Noise STD")
+    plt.ylabel("Accuracy")
+    plt.title("Robustness Evaluation")
+    plt.grid(True)
+
+    #Confusion
+    fig_cm = plt.figure(figsize=(6, 6))
     class_names = [f"Gesture {i}" for i in range(num_classes)]
     evaluate_confusion_matrix(model, test_loader, device, class_names)
+
+    plt.show()
 
 if __name__ == "__main__":
     main()

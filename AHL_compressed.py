@@ -1,4 +1,5 @@
 import os
+import random
 import numpy as np
 from sklearn.decomposition import PCA
 import torch
@@ -6,6 +7,20 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from torch.nn.utils import clip_grad_norm_
+
+
+def set_seed(seed=42):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+    # Make PyTorch deterministic
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+set_seed(42)
+
 
 
 #  Dataset & Data Loaders
@@ -153,7 +168,7 @@ class AdaptiveHiddenLayer(nn.Module):
         for linear, ln in zip(self.groups, self.lns):
             z = linear(x)
             z = ln(z)
-            out = F.relu(z)
+            out = F.silu(z)
             group_outputs.append(out)
 
         # Stack -> (batch, N, group_size)
@@ -210,24 +225,24 @@ class GestureAHLNet(nn.Module):
             hog_dim, 256, num_groups=2,
             temperature=selector_temp, hard_gating=hard_gating
         )
-        self.hog_drop1 = nn.Dropout(p=0.2)
+        self.hog_drop1 = nn.Dropout(p=0.3)
         self.hog_ahl2 = AdaptiveHiddenLayer(
             256, 256, num_groups=2,
             temperature=selector_temp, hard_gating=hard_gating
         )
-        self.hog_drop2 = nn.Dropout(p=0.2)
+        self.hog_drop2 = nn.Dropout(p=0.3)
 
         # Accelerometer subnetwork
         self.acc_ahl1 = AdaptiveHiddenLayer(
             acc_dim, 128, num_groups=2,
             temperature=selector_temp, hard_gating=hard_gating
         )
-        self.acc_drop1 = nn.Dropout(p=0.1)
+        self.acc_drop1 = nn.Dropout(p=0.2)
         self.acc_ahl2 = AdaptiveHiddenLayer(
             128, 128, num_groups=2,
             temperature=selector_temp, hard_gating=hard_gating
         )
-        self.acc_drop2 = nn.Dropout(p=0.1)
+        self.acc_drop2 = nn.Dropout(p=0.2)
 
         # Joint subnetwork: input is 256 (HOG) + 128 (ACC) = 384
         self.joint_ahl = AdaptiveHiddenLayer(
@@ -235,8 +250,10 @@ class GestureAHLNet(nn.Module):
             temperature=selector_temp, hard_gating=hard_gating
         )
 
+        self.final_norm = nn.LayerNorm(256)
+
         # Dropout
-        self.dropout = nn.Dropout(p=dropout)
+        self.dropout = nn.Dropout(p=0.2)
 
         # Final classifier
         self.classifier = nn.Linear(256, num_classes)
@@ -259,6 +276,7 @@ class GestureAHLNet(nn.Module):
         alpha_list.append(alpha)
         out_hog = self.hog_drop2(out_hog)
 
+
         # ACC branch
         out_acc, alpha = self.acc_ahl1(acc_input)
         alpha_list.append(alpha)
@@ -274,8 +292,10 @@ class GestureAHLNet(nn.Module):
         out_joint, alpha = self.joint_ahl(fused)
         alpha_list.append(alpha)
 
-        out_joint = self.dropout(out_joint)
 
+        out_joint = self.dropout(out_joint)
+        
+        out_joint = self.final_norm(out_joint)
         # Classifier
         logits = self.classifier(out_joint)
 
@@ -420,7 +440,29 @@ def main():
         lr=init_lr,
         weight_decay=weight_decay,
     )
+    '''
+    optimizer = torch.optim.SGD(
+        model.parameters(),
+        lr=init_lr,
+        momentum=0.9,
+        weight_decay=weight_decay,
+    )
+    optimizer = torch.optim.RMSprop(
+        model.parameters(),
+        lr=init_lr,
+        alpha=0.99,
+        momentum=0.9,
+        weight_decay=weight_decay,
+    )'''
+
     scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=15, gamma=0.5)
+
+    '''scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer,
+        T_max=25,      # full cycle = 25 epochs
+        eta_min=1e-5   # minimum LR
+    )'''
+
 
     best_test_acc = 0.0
     for epoch in range(1, num_epochs + 1):

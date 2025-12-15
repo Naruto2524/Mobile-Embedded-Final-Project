@@ -7,6 +7,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from torch.nn.utils import clip_grad_norm_
+from sklearn.metrics import confusion_matrix, ConfusionMatrixDisplay
+import matplotlib.pyplot as plt
 
 
 def set_seed(seed=42):
@@ -396,6 +398,45 @@ def evaluate(model, data_loader, criterion, device, beta_sbr=1.0, hard_gating: b
 def count_params(model):
     return sum(p.numel() for p in model.parameters())
 
+#Robustness
+def evaluate_with_noise(model, data_loader, device, noise_std):
+    print(f"[DEBUG] Evaluating with noise std = {noise_std}")
+    model.eval()
+    correct, total = 0, 0
+
+    with torch.no_grad():
+        for hog, acc, labels in data_loader:
+            hog, acc, labels = hog.to(device), acc.to(device), labels.to(device)
+            hog = hog + noise_std * torch.randn_like(hog)
+
+            logits, _ = model(hog, acc)
+            correct += (logits.argmax(1) == labels).sum().item()
+            total += labels.size(0)
+
+    return correct / total
+
+#confusion matrix
+def evaluate_confusion_matrix(model, loader, device, class_names):
+    model.eval()
+    preds, labels_all = [], []
+
+    with torch.no_grad():
+        for hog, acc, labels in loader:
+            hog, acc = hog.to(device), acc.to(device)
+            logits, _ = model(hog, acc)
+
+            preds.append(logits.argmax(1).cpu().numpy())
+            labels_all.append(labels.numpy())
+
+    preds = np.concatenate(preds)
+    labels_all = np.concatenate(labels_all)
+
+    cm = confusion_matrix(labels_all, preds)
+    disp = ConfusionMatrixDisplay(cm, display_labels=class_names)
+    disp.plot(ax=plt.gca(), cmap="Blues", xticks_rotation=45)
+    plt.title("Confusion Matrix (Test Set)")
+    plt.tight_layout()
+    plt.show(block=True)
 
 def main():
     # Config

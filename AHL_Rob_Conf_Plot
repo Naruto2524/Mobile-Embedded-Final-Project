@@ -1,0 +1,435 @@
+import os
+import matplotlib.pyplot as plt
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+from sklearn.metrics import confusion_matrix, ConfusionMatrixDisplay
+
+
+#  Dataset & Data Loaders
+
+class GestureDataset(Dataset):
+
+    def __init__(self, hog_data, acc_data, labels):
+        assert len(hog_data) == len(acc_data) == len(labels)
+        self.hog = torch.tensor(hog_data, dtype=torch.float32)
+        self.acc = torch.tensor(acc_data, dtype=torch.float32)
+        self.labels = torch.tensor(labels, dtype=torch.long)
+
+    def __len__(self):
+        return len(self.labels)
+
+    def __getitem__(self, idx):
+        return self.hog[idx], self.acc[idx], self.labels[idx]
+
+
+def build_loaders(
+    data_dir: str,
+    batch_size: int = 128,
+    hog_dim: int = 8100,
+    acc_dim: int = 53,
+    num_classes: int = 10,
+):
+
+    # Load numpy arrays
+    hog_train = np.load(os.path.join(data_dir, "hog_train.npy"))
+    acc_train = np.load(os.path.join(data_dir, "acc_train.npy"))
+    y_train   = np.load(os.path.join(data_dir, "labels_train.npy"))
+
+    hog_test  = np.load(os.path.join(data_dir, "hog_test.npy"))
+    acc_test  = np.load(os.path.join(data_dir, "acc_test.npy"))
+    y_test    = np.load(os.path.join(data_dir, "labels_test.npy"))
+
+    assert hog_train.shape[1] == hog_dim, f"Expected HOG dim {hog_dim}, got {hog_train.shape[1]}"
+    assert acc_train.shape[1] == acc_dim, f"Expected ACC dim {acc_dim}, got {acc_train.shape[1]}"
+
+    # Normalize features
+    hog_mean = hog_train.mean(axis=0, keepdims=True)
+    hog_std  = hog_train.std(axis=0, keepdims=True) + 1e-6
+    acc_mean = acc_train.mean(axis=0, keepdims=True)
+    acc_std  = acc_train.std(axis=0, keepdims=True) + 1e-6
+
+    hog_train = (hog_train - hog_mean) / hog_std
+    hog_test  = (hog_test  - hog_mean) / hog_std
+    acc_train = (acc_train - acc_mean) / acc_std
+    acc_test  = (acc_test  - acc_mean) / acc_std
+
+    # Build Dataset objects
+    train_dataset = GestureDataset(hog_train, acc_train, y_train)
+    test_dataset  = GestureDataset(hog_test,  acc_test,  y_test)
+
+    # DataLoaders
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        drop_last=True,
+    )
+
+    test_loader = DataLoader(
+        test_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        drop_last=False,
+    )
+
+    return train_loader, test_loader, num_classes, hog_dim, acc_dim
+
+
+#  Adaptive Hidden Layer
+
+class AdaptiveHiddenLayer(nn.Module):
+
+    def __init__(self, input_dim: int, group_size: int, num_groups: int = 2):
+        super().__init__()
+        self.num_groups = num_groups
+        self.group_size = group_size
+
+        # Neuron groups
+        self.groups = nn.ModuleList([
+            nn.Linear(input_dim, group_size) for _ in range(num_groups)
+        ])
+
+        self.bns = nn.ModuleList([
+            nn.BatchNorm1d(group_size) for _ in range(num_groups)
+        ])
+
+        # Selector
+        self.selector = nn.Linear(input_dim, num_groups)
+
+        # Initialization: use Xavier for all
+        for m in self.groups:
+            nn.init.kaiming_uniform_(m.weight, nonlinearity='relu')
+            nn.init.constant_(m.bias, 0.0)
+
+        nn.init.xavier_uniform_(self.selector.weight)
+        nn.init.constant_(self.selector.bias, 0.0)
+
+    def forward(self, x: torch.Tensor):
+        # Group outputs with ReLU
+        group_outputs = []
+        for linear, bn in zip(self.groups, self.bns):
+            z = linear(x)
+            z = bn(z)
+            out = F.relu(z)
+            group_outputs.append(out)
+
+        # Stack -> (batch, N, group_size)
+        groups_stack = torch.stack(group_outputs, dim=1)
+
+        # Selector: (batch, N) -> softmax
+        alpha_logits = self.selector(x)
+        alpha = F.softmax(alpha_logits, dim=1)
+
+        # Weighted sum over groups
+        alpha_expanded = alpha.unsqueeze(2)           # (batch, N, 1)
+        weighted = groups_stack * alpha_expanded      # (batch, N, group_size)
+        y = weighted.sum(dim=1)                       # (batch, group_size)
+
+        return y, alpha
+
+
+#  AHL Gesture Network
+
+class GestureAHLNet(nn.Module):
+    """
+    Multi-modal gesture network:
+      - Visual branch: HOG -> AHL(64) -> AHL(128)
+      - Motion branch: ACC -> AHL(64) -> AHL(128)
+      - Joint AHL on concatenated 128+128 -> 256
+      - Classifier: 256 -> num_classes
+    """
+
+    def __init__(self, hog_dim=1200, acc_dim=53, num_classes=14):
+        super().__init__()
+        # HOG subnetwork
+        self.hog_ahl1 = AdaptiveHiddenLayer(hog_dim, 64, num_groups=2)
+        self.hog_ahl2 = AdaptiveHiddenLayer(64,      128, num_groups=2)
+
+        # Accelerometer subnetwork
+        self.acc_ahl1 = AdaptiveHiddenLayer(acc_dim, 64, num_groups=2)
+        self.acc_ahl2 = AdaptiveHiddenLayer(64,      128, num_groups=2)
+
+        # Joint subnetwork
+        self.joint_ahl = AdaptiveHiddenLayer(256, 256, num_groups=2)
+
+        # Final classifier
+        self.classifier = nn.Linear(256, num_classes)
+
+    def forward(self, hog_input, acc_input):
+        """
+        hog_input: (batch, hog_dim)
+        acc_input: (batch, acc_dim)
+        Returns:
+          logits:    (batch, num_classes)
+          alpha_list: list of selector distributions from all AHLs
+        """
+        alpha_list = []
+
+        # HOG branch
+        out_hog, alpha = self.hog_ahl1(hog_input)
+        alpha_list.append(alpha)
+        out_hog, alpha = self.hog_ahl2(out_hog)
+        alpha_list.append(alpha)
+
+        # ACC branch
+        out_acc, alpha = self.acc_ahl1(acc_input)
+        alpha_list.append(alpha)
+        out_acc, alpha = self.acc_ahl2(out_acc)
+        alpha_list.append(alpha)
+
+        # Fuse
+        fused = torch.cat([out_hog, out_acc], dim=1)  # (batch, 256)
+
+        # Joint AHL
+        out_joint, alpha = self.joint_ahl(fused)
+        alpha_list.append(alpha)
+
+        # Classifier
+        logits = self.classifier(out_joint)
+
+        return logits, alpha_list
+
+
+#  Selection Balancing Regularizer
+
+def selection_balancing_loss(alpha_list, beta: float = 1.0, eps: float = 1e-6):
+    """
+    SBR: encourages balanced usage of groups across a batch.
+    For each AHL:
+      p(n) = mean over batch of alpha_n (selector output)
+      L_sbr = -beta * sum_n (p(n)+eps) log(p(n)+eps)
+    """
+    sbr_loss = 0.0
+    for alpha in alpha_list:
+        # alpha: (batch, N)
+        p = alpha.mean(dim=0)  # (N,)
+        entropy = -(p + eps) * torch.log(p + eps)
+        sbr_loss = sbr_loss + entropy.sum()
+    return beta * sbr_loss
+
+
+#  Training / Evaluation
+
+def train_one_epoch(model, train_loader, optimizer, criterion, device, beta_sbr=1.0):
+    model.train()
+    running_loss = 0.0
+    correct = 0
+    total = 0
+
+    for hog_feats, acc_feats, labels in train_loader:
+        hog_feats = hog_feats.to(device)
+        acc_feats = acc_feats.to(device)
+        labels    = labels.to(device)
+
+        optimizer.zero_grad()
+
+        logits, alpha_list = model(hog_feats, acc_feats)
+        cls_loss = criterion(logits, labels)
+        sbr_loss = selection_balancing_loss(alpha_list, beta=beta_sbr)
+        loss = cls_loss + sbr_loss
+
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm = 5.0)
+        optimizer.step()
+
+        running_loss += loss.item() * labels.size(0)
+
+        # Accuracy
+        preds = logits.argmax(dim=1)
+        correct += (preds == labels).sum().item()
+        total   += labels.size(0)
+
+    avg_loss = running_loss / total
+    acc = correct / total
+    return avg_loss, acc
+
+
+def evaluate(model, data_loader, criterion, device, beta_sbr=1.0):
+    model.eval()
+    running_loss = 0.0
+    correct = 0
+    total = 0
+
+    with torch.no_grad():
+        for hog_feats, acc_feats, labels in data_loader:
+            hog_feats = hog_feats.to(device)
+            acc_feats = acc_feats.to(device)
+            labels    = labels.to(device)
+
+            logits, alpha_list = model(hog_feats, acc_feats)
+            cls_loss = criterion(logits, labels)
+            sbr_loss = selection_balancing_loss(alpha_list, beta=beta_sbr)
+            loss = cls_loss + sbr_loss
+
+            running_loss += loss.item() * labels.size(0)
+
+            preds = logits.argmax(dim=1)
+            correct += (preds == labels).sum().item()
+            total   += labels.size(0)
+
+    avg_loss = running_loss / total
+    acc = correct / total
+    return avg_loss, acc
+
+
+#Robustness
+def evaluate_with_noise(model, data_loader, device, noise_std):
+    print(f"[DEBUG] Evaluating with noise std = {noise_std}")
+    model.eval()
+    correct, total = 0, 0
+
+    with torch.no_grad():
+        for hog, acc, labels in data_loader:
+            hog, acc, labels = hog.to(device), acc.to(device), labels.to(device)
+            hog = hog + noise_std * torch.randn_like(hog)
+
+            logits, _ = model(hog, acc)
+            correct += (logits.argmax(1) == labels).sum().item()
+            total += labels.size(0)
+
+    return correct / total
+
+#confusion matrix
+def evaluate_confusion_matrix(model, loader, device, class_names):
+    model.eval()
+    preds, labels_all = [], []
+
+    with torch.no_grad():
+        for hog, acc, labels in loader:
+            hog, acc = hog.to(device), acc.to(device)
+            logits, _ = model(hog, acc)
+
+            preds.append(logits.argmax(1).cpu().numpy())
+            labels_all.append(labels.numpy())
+
+    preds = np.concatenate(preds)
+    labels_all = np.concatenate(labels_all)
+
+    cm = confusion_matrix(labels_all, preds)
+    disp = ConfusionMatrixDisplay(cm, display_labels=class_names)
+    disp.plot(ax=plt.gca(), cmap="Blues", xticks_rotation=45)
+    plt.title("Confusion Matrix (Test Set)")
+    plt.tight_layout()
+    plt.show(block=True)
+
+
+def main():
+    # Config
+    data_dir    = "./data"
+    hog_dim     = 8100
+    acc_dim     = 53
+    num_classes = 10
+    batch_size  = 64
+    num_epochs  = 20
+    init_lr     = 1e-3
+    weight_decay = 1e-4
+    momentum     = 0.9
+    beta_sbr     = 0.01
+
+    # Data
+    train_loader, test_loader, num_classes, hog_dim, acc_dim = build_loaders(
+        data_dir=data_dir,
+        batch_size=batch_size,
+        hog_dim=hog_dim,
+        acc_dim=acc_dim,
+        num_classes=num_classes,
+    )
+
+    # Device
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print("Using device:", device)
+
+    # Model, Optimizer, Scheduler
+    model = GestureAHLNet(hog_dim=hog_dim, acc_dim=acc_dim, num_classes=num_classes).to(device)
+    criterion = nn.CrossEntropyLoss()
+    optimizer = torch.optim.SGD(
+        model.parameters(),
+        lr=init_lr,
+        momentum=momentum,
+        weight_decay=weight_decay,
+    )
+    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=10, gamma=0.5)
+
+    # Metric storage
+    train_acc_list = []
+    test_acc_list  = []
+    train_loss_list = []
+    test_loss_list  = []
+
+    best_test_acc = 0.0
+
+    for epoch in range(1, num_epochs + 1):
+        train_loss, train_acc = train_one_epoch(
+            model, train_loader, optimizer, criterion, device, beta_sbr=beta_sbr
+        )
+        test_loss, test_acc = evaluate(
+            model, test_loader, criterion, device, beta_sbr=beta_sbr
+        )
+
+        scheduler.step()
+
+        # Store metrics
+        train_acc_list.append(train_acc)
+        test_acc_list.append(test_acc)
+        train_loss_list.append(train_loss)
+        test_loss_list.append(test_loss)
+
+        print(
+            f"Epoch [{epoch:03d}/{num_epochs:03d}] "
+            f"Train Loss: {train_loss:.4f} | Train Acc: {train_acc*100:.2f}% | "
+            f"Test Loss: {test_loss:.4f} | Test Acc: {test_acc*100:.2f}%"
+        )
+
+        # Save best model
+        if test_acc > best_test_acc:
+            best_test_acc = test_acc
+            torch.save(model.state_dict(), os.path.join(data_dir, "best_ahl_model.pth"))
+
+    print(f"Best test accuracy: {best_test_acc*100:.2f}%")
+
+    fig_acc = plt.figure(figsize=(10, 4))
+    plt.plot(train_acc_list, label="Train Accuracy")
+    plt.plot(test_acc_list, label="Test Accuracy")
+    plt.title("Accuracy over Epochs")
+    plt.xlabel("Epoch")
+    plt.ylabel("Accuracy")
+    plt.legend()
+    plt.grid(True)
+
+    fig_loss = plt.figure(figsize=(10, 4))
+    plt.plot(train_loss_list, label="Train Loss")
+    plt.plot(test_loss_list, label="Test Loss")
+    plt.title("Loss over Epochs")
+    plt.xlabel("Epoch")
+    plt.ylabel("Loss")
+    plt.legend()
+    plt.grid(True)
+
+    #Robustness
+    noise_levels = [0.0, 0.05, 0.1, 0.2]
+    robustness_accs = []
+
+    for sigma in noise_levels:
+        acc = evaluate_with_noise(model, test_loader, device, sigma)
+        robustness_accs.append(acc)
+        print(f"Noise STD {sigma:.2f} → Accuracy {acc*100:.2f}%")
+
+    fig_robust = plt.figure(figsize=(6, 4))
+    plt.plot(noise_levels, robustness_accs, marker='o')
+    plt.xlabel("Noise STD")
+    plt.ylabel("Accuracy")
+    plt.title("Robustness Evaluation")
+    plt.grid(True)
+
+    #Confusion
+    fig_cm = plt.figure(figsize=(6, 6))
+    class_names = [f"Gesture {i}" for i in range(num_classes)]
+    evaluate_confusion_matrix(model, test_loader, device, class_names)
+
+    plt.show()
+
+if __name__ == "__main__":
+    main()
